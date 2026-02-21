@@ -173,7 +173,7 @@ def extrapolate_and_plot(
     axes[0].set_xlabel(f"Time ({punit})")
     axes[0].set_ylabel("Energy (J)")
     axes[0].set_title(f"Measured per-step energy — {profile_epochs} epoch(s) profiled")
-    axes[0].legend()
+    axes[0].legend(loc="upper right")
 
     # Right: tiled per-step energy extrapolated over full training
     ext_times_cum = np.cumsum(pred_times)
@@ -189,7 +189,7 @@ def extrapolate_and_plot(
     axes[1].set_xlabel(f"Time ({ext_unit})")
     axes[1].set_ylabel("Energy (J)")
     axes[1].set_title(f"Projected per-step energy — {config.total_epochs} epochs")
-    axes[1].legend()
+    axes[1].legend(loc="upper right")
 
     plt.tight_layout()
     plot_path = assets_dir / f"{out_stem}_energy.png"
