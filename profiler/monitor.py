@@ -1,19 +1,18 @@
 import sys
-import inspect
-import importlib.util
-import json
 import argparse
-from itertools import islice
+import importlib.util
+import inspect
+import json
+import time
 from pathlib import Path
 
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import time
-
-import torch
+import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from profiler.models import TrainingJob, JobConfig
 
 WARMUP_STEPS = 5
@@ -135,8 +134,12 @@ def extrapolate_and_plot(
     lower_energy = (energy_mean - energy_std) * np.arange(1, total_steps + 1) / 3600
     epoch_times_s = np.array([steps_per_epoch * e * time_mean for e in range(1, config.total_epochs + 1)])
 
+    reps = int(np.ceil(total_steps / len(step_energies)))
+    pred_energies = np.tile(step_energies, reps)[:total_steps]
+    pred_times = np.tile(step_times, reps)[:total_steps]
+
     output = {
-        "profiled_steps": len(step_energies),
+        "profiled_epochs": profile_epochs,
         "steps_per_epoch": steps_per_epoch,
         "total_epochs": config.total_epochs,
         "total_steps": total_steps,
@@ -146,8 +149,10 @@ def extrapolate_and_plot(
         "std_time_per_step_s": round(float(time_std), 6),
         "estimated_total_energy_Wh": round(float(cumulative_energy[-1]), 4),
         "estimated_total_time_s": round(float(cum_time_s[-1]), 2),
-        "step_energy_J": [round(e, 4) for e in step_energies.tolist()],
-        "step_time_s": [round(t, 6) for t in step_times.tolist()],
+        "profiled_step_energy_J": [round(e, 4) for e in step_energies.tolist()],
+        "profiled_step_time_s": [round(t, 6) for t in step_times.tolist()],
+        "step_energy_J": [round(e, 4) for e in pred_energies.tolist()],
+        "step_time_s": [round(t, 6) for t in pred_times.tolist()],
     }
     assets_dir = Path(__file__).resolve().parent / "assets"
     assets_dir.mkdir(exist_ok=True)
@@ -155,7 +160,6 @@ def extrapolate_and_plot(
     with open(json_path, "w") as f:
         json.dump(output, f, indent=2)
 
-    import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
 
     # Left: measured per-step energy during profiling
@@ -172,13 +176,10 @@ def extrapolate_and_plot(
     axes[0].legend()
 
     # Right: tiled per-step energy extrapolated over full training
-    reps = int(np.ceil(total_steps / len(step_energies)))
-    ext_energies = np.tile(step_energies, reps)[:total_steps]
-    ext_times = np.tile(step_times, reps)[:total_steps]
-    ext_times_cum = np.cumsum(ext_times)
+    ext_times_cum = np.cumsum(pred_times)
     ext_time, ext_unit = _time_axis(ext_times_cum)
     epoch_marks, _ = _time_axis(epoch_times_s)
-    axes[1].plot(ext_time, ext_energies, color="steelblue", alpha=0.6)
+    axes[1].plot(ext_time, pred_energies, color="steelblue", alpha=0.6)
     axes[1].axhline(energy_mean, color="red", linestyle="--", label=f"mean = {energy_mean:.2f} J")
     axes[1].fill_between(ext_time,
                          energy_mean - energy_std, energy_mean + energy_std,
