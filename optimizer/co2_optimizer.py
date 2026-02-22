@@ -31,9 +31,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
-from scipy.integrate import quad
-from scipy.optimize import minimize_scalar
 
 # ────────────────────────────────────────────────────────────────
 # Configuration
@@ -45,7 +42,8 @@ CI_CACHE_PATH = DATA_DIR / "ci_cache.json"
 JOB_DURATION  = 8_000.0      # seconds – the job timestamp
 DELTA         = 10.0          # seconds – width of each pause window
 MAX_STEPS     = 1_000         # maximum number of cut-out attempts
-PATIENCE      = 5             # early-stop after this many non-improving cuts
+PATIENCE      = 10             # early-stop after this many non-improving cuts
+MIN_IMPROVE   = 1e-6          # stop when marginal improvement < this fraction
 N_INTERP      = 8_000         # interpolation grid resolution
 
 
@@ -159,25 +157,6 @@ def create_co2_interpolator(times_seconds, ci_values):
 # 3. g-cropping optimisation machinery
 # ────────────────────────────────────────────────────────────────
 
-def J_crop(a, f_func, g_func, T_g, delta):
-    """
-    Objective: ∫₀^{T_g - δ} f(x) · g'(x) dx
-    where g' crops [a, a+δ] out of g and shifts left.
-    """
-    T_new = T_g - delta
-    if a < 0 or a > T_new:
-        return 1e30
-
-    def integrand(x):
-        if x < a:
-            return float(f_func(x)) * float(g_func(x))
-        else:
-            return float(f_func(x)) * float(g_func(x + delta))
-
-    val, _ = quad(integrand, 0, T_new, limit=400, points=[a])
-    return val
-
-
 def compressed_to_real(x, sorted_real_cuts, delta):
     """Map compressed-space position → original g coordinate."""
     pos = x
@@ -187,6 +166,60 @@ def compressed_to_real(x, sorted_real_cuts, delta):
         else:
             break
     return pos
+
+
+def find_best_cut(f_arr, g_arr, h, delta_idx):
+    """
+    Given fixed f and g arrays on a uniform grid with spacing *h*,
+    find the cut position that minimises ∫₀ᵀ f·g' where g' is g
+    with [i, i+delta_idx) removed and the right part shifted left.
+
+    The integral is always over [0, T] (the domain of f, length N).
+    g must be at least N + delta_idx long so that shifted values
+    from beyond T can slide in.
+
+    Parameters
+    ----------
+    f_arr     : ndarray, shape (N,)    – power profile on [0, T]
+    g_arr     : ndarray, shape (≥ N + delta_idx,)  – carbon intensity
+    h         : float                  – grid spacing
+    delta_idx : int                    – width of cut in grid cells
+
+    Returns
+    -------
+    best_idx : int     – grid index of the optimal cut start
+    best_J   : float   – objective value after this cut
+    """
+    N = len(f_arr)
+    assert len(g_arr) >= N + delta_idx, \
+        f"g too short: need {N + delta_idx}, have {len(g_arr)}"
+
+    # f·g (no shift) and f·g_shifted (cut applied), both length N
+    fg       = f_arr * g_arr[:N]
+    fg_shift = f_arr * g_arr[delta_idx:delta_idx + N]
+
+    # Cumulative trapezoidal sums (length N)
+    fg_pan = 0.5 * h * (fg[:-1] + fg[1:])
+    gs_pan = 0.5 * h * (fg_shift[:-1] + fg_shift[1:])
+
+    F_cum    = np.empty(N)
+    G_cum    = np.empty(N)
+    F_cum[0] = 0.0
+    G_cum[0] = 0.0
+    np.cumsum(fg_pan, out=F_cum[1:])
+    np.cumsum(gs_pan, out=G_cum[1:])
+
+    # J(i) = ∫₀^{x_i} f·g  +  ∫_{x_i}^T f·g_shifted
+    J_all = F_cum + (G_cum[-1] - G_cum)
+
+    best_idx = int(np.argmin(J_all))
+    return best_idx, float(J_all[best_idx])
+
+
+def crop_g(g_arr, cut_idx, delta_idx):
+    """Remove g_arr[cut_idx : cut_idx + delta_idx] and stitch."""
+    return np.concatenate([g_arr[:cut_idx],
+                           g_arr[cut_idx + delta_idx:]])
 
 
 # ────────────────────────────────────────────────────────────────
@@ -204,118 +237,71 @@ def run_optimisation(
     verbose: bool       = True,
 ):
     """
-    Iteratively crop δ-wide windows from g to minimise ∫ f·g.
+    Iteratively crop δ-wide windows from g to minimise ∫₀ᵀ f·g.
+
+    Each step calls ``find_best_cut`` on the current (f, g) pair,
+    then stitches g via ``crop_g`` before the next iteration.
 
     Returns
     -------
     sorted_real_cuts : list[float]
-        Start positions (original g-space) of accepted pause windows.
+        Pause-start positions in original wall-clock seconds.
     J_history : list[float]
         Objective value after each accepted cut.
-    cut_savings : list[float]
-        CO₂ saving (relative to no-cut baseline) of each accepted cut,
-        sorted by descending impact.
     baseline_J : float
         Original ∫ f·g with no pauses.
+    eff_delta : float
+        Effective δ after grid-snapping.
     """
-    # ── Build working copy of g on a grid ──────────────────────
-    cur_x     = np.linspace(0, T, n_interp)
-    cur_g_vals = g_func(cur_x)
-    cur_g      = interp1d(cur_x, cur_g_vals, kind="linear",
-                          bounds_error=False, fill_value=0.0)
+    # ── Discretise f and g ─────────────────────────────────────
+    x_grid    = np.linspace(0, T, n_interp)
+    h         = x_grid[1] - x_grid[0]
+    delta_idx = max(1, int(round(delta / h)))
+    eff_delta = delta_idx * h
+    N         = n_interp
 
-    baseline_J = quad(lambda x: float(f_func(x)) * float(g_func(x)),
-                      0, T, limit=400)[0]
+    f_arr = np.asarray(f_func(x_grid), dtype=np.float64)
 
-    T_g              = T
+    # g extends well beyond T so values can slide in as cuts accumulate
+    g_len = N + (max_steps + 1) * delta_idx
+    x_g   = np.arange(g_len) * h
+    g_arr = np.asarray(g_func(x_g), dtype=np.float64).copy()
+
+    baseline_J = float(np.trapz(f_arr * g_arr[:N], dx=h))
+
     sorted_real_cuts = []
     J_history        = []
     no_improve_count = 0
     best_J           = baseline_J
-    best_real_cuts   = []          # best schedule seen so far
-    prev_J           = baseline_J
-
-    # Piece tracking: intervals of the compressed domain where g is
-    # still present.  After each accepted cut at a_s the piece
-    # containing a_s splits; later pieces shift left by δ.
-    pieces = [(0.0, T)]
+    best_real_cuts   = []
 
     if verbose:
         print(f"Baseline CO₂ cost (∫ f·g): {baseline_J:.4f}")
-        print(f"δ = {delta} s, max steps = {max_steps}, patience = {patience}")
+        print(f"δ = {delta} s  (grid: {delta_idx} cells × {h:.4f} s "
+              f"= {eff_delta:.4f} s)")
+        print(f"f grid: {N} pts on [0, {T:.0f}] s, h = {h:.4f} s")
+        print(f"g grid: {g_len} pts on [0, {x_g[-1]:.0f}] s")
+        print(f"max steps = {max_steps}, patience = {patience}")
         print("─" * 65)
 
     for step_i in range(max_steps):
-        T_new = T_g - delta
-        if T_new <= 0:
+        if len(g_arr) < N + delta_idx:
             if verbose:
-                print(f"  Step {step_i+1}: domain exhausted, stopping.")
+                print(f"  Step {step_i+1}: g exhausted, stopping.")
             break
 
-        _g, _T_g = cur_g, T_g
+        # ── Find the best single cut on current g ─────────────
+        cut_idx, J_val = find_best_cut(f_arr, g_arr, h, delta_idx)
 
-        def J_this(a, _f=f_func, _g=_g, _T_g=_T_g, _delta=delta):
-            return J_crop(a, _f, _g, _T_g, _delta)
-
-        # ── Per-piece local optimisation ──────────────────────
-        best_a         = None
-        best_J_piece   = 1e30
-        best_pi        = None
-
-        for pi, (p_lo, p_hi) in enumerate(pieces):
-            width = p_hi - p_lo
-            if width < 1e-10:
-                continue
-            # Clamp bounds to [0, T_new]
-            lo = max(0.0, p_lo)
-            hi = min(T_new, p_hi)
-            if hi - lo < 1e-10:
-                continue
-            try:
-                res_loc = minimize_scalar(
-                    J_this, bounds=(lo, hi), method="bounded",
-                    options={"xatol": 1e-10, "maxiter": 2000})
-                if res_loc.fun < best_J_piece:
-                    best_J_piece = res_loc.fun
-                    best_a       = res_loc.x
-                    best_pi      = pi
-            except Exception:
-                pass
-
-        if best_a is None:
-            if verbose:
-                print(f"  Step {step_i+1}: no valid piece, stopping.")
-            break
-
-        J_val = best_J_piece
-
-        # Always accept the cut, but track the best schedule
-        a_s = best_a
-
-        # Map to original g-space
-        real_a = compressed_to_real(a_s, sorted_real_cuts, delta)
+        # Map compressed-domain index → original g time
+        a_s    = cut_idx * h
+        real_a = compressed_to_real(a_s, sorted_real_cuts, eff_delta)
         sorted_real_cuts.append(real_a)
         sorted_real_cuts.sort()
 
-        # ── Update piece list ─────────────────────────────────
-        p_lo, p_hi = pieces[best_pi]
-        new_pieces = []
-        for pi, (lo_p, hi_p) in enumerate(pieces):
-            if pi < best_pi:
-                new_pieces.append((lo_p, hi_p))
-            elif pi == best_pi:
-                if a_s - p_lo > 1e-10:
-                    new_pieces.append((p_lo, a_s))
-                if p_hi - a_s - delta > 1e-10:
-                    new_pieces.append((a_s, p_hi - delta))
-            else:
-                new_pieces.append((lo_p - delta, hi_p - delta))
-        pieces = [(max(0, lo), hi) for lo, hi in new_pieces if hi > lo + 1e-10]
-
         J_history.append(J_val)
-        prev_J = J_val
 
-        # Track the best schedule
+        # Track best schedule seen
         if J_val < best_J - 1e-12:
             best_J         = J_val
             best_real_cuts = list(sorted_real_cuts)
@@ -326,141 +312,174 @@ def run_optimisation(
         if verbose and (step_i < 10 or (step_i + 1) % 50 == 0
                         or step_i == max_steps - 1
                         or no_improve_count > 0):
-            tag = "" if no_improve_count == 0 else \
-                  f" [no improve {no_improve_count}/{patience}]"
+            tag = ""
+            if no_improve_count > 0:
+                tag = f" [no improve {no_improve_count}/{patience}]"
             print(f"  Step {step_i+1}: a_real={real_a:.1f} s, "
                   f"J={J_val:.4f}, saved {baseline_J - J_val:.4f} "
                   f"({(baseline_J - J_val)/baseline_J*100:.2f}%){tag}")
 
         if no_improve_count >= patience:
             if verbose:
-                print(f"  Early stopping at step {step_i+1}: "
-                      f"patience exhausted. "
-                      f"Reverting to best schedule "
-                      f"({len(best_real_cuts)} cuts, "
+                print(f"  Early stopping: patience exhausted. "
+                      f"Reverting to best ({len(best_real_cuts)} cuts, "
                       f"J={best_J:.4f}).")
             break
 
-        # Rebuild cropped g
-        new_x      = np.linspace(0, T_new, n_interp)
-        new_g_vals = np.zeros(n_interp)
-        for k, xv in enumerate(new_x):
-            if xv < a_s:
-                new_g_vals[k] = float(cur_g(xv))
-            else:
-                new_g_vals[k] = float(cur_g(xv + delta))
+        # ── Stitch g: remove the cut and continue ─────────────
+        g_arr = crop_g(g_arr, cut_idx, delta_idx)
 
-        cur_g = interp1d(new_x, new_g_vals, kind="linear",
-                         bounds_error=False, fill_value=0.0)
-        T_g = T_new
-
-    # Use the best tracked schedule
+    # Return the best tracked schedule
     sorted_real_cuts = best_real_cuts if best_real_cuts else sorted_real_cuts
     final_J = best_J
-
-    # ── Per-cut savings (sorted by descending impact) ──────────
-    # Compute the marginal saving of each cut by replaying one at a time
-    # on the original g, ranked by single-cut impact.
-    cut_savings = []
-    for c in sorted_real_cuts:
-        # J with only this single cut
-        def _make_integrand(cut_pos):
-            def _integrand(x):
-                if x < cut_pos:
-                    return float(f_func(x)) * float(g_func(x))
-                else:
-                    return float(f_func(x)) * float(g_func(x + delta))
-            return _integrand
-        T_single = T - delta
-        j_single = quad(_make_integrand(c), 0, T_single,
-                        limit=400, points=[c])[0]
-        cut_savings.append(baseline_J - j_single)
-
-    # Sort descending
-    order       = np.argsort(cut_savings)[::-1]
-    cut_savings = [cut_savings[i] for i in order]
-    ordered_cuts = [sorted_real_cuts[i] for i in order]
 
     if verbose:
         print("─" * 65)
         print(f"Best schedule: {len(sorted_real_cuts)} cuts")
+        total_pause = len(sorted_real_cuts) * eff_delta
+        print(f"Total pause time: {total_pause:.1f} s "
+              f"({total_pause/T*100:.1f}% of job)")
         print(f"Best CO₂ cost: {final_J:.4f}  "
               f"(saved {baseline_J - final_J:.4f}, "
               f"{(baseline_J - final_J)/baseline_J*100:.2f}%)")
 
-    return sorted_real_cuts, J_history, cut_savings, ordered_cuts, baseline_J
+    return sorted_real_cuts, J_history, baseline_J, eff_delta
 
 
 # ────────────────────────────────────────────────────────────────
 # 5. Plotting
 # ────────────────────────────────────────────────────────────────
 
+def _merge_pauses(sorted_cuts, delta):
+    """Merge overlapping/adjacent [c, c+δ) intervals into consolidated pauses."""
+    if not sorted_cuts:
+        return []
+    merged = []
+    for c in sorted(sorted_cuts):
+        s, e = c, c + delta
+        if merged and s <= merged[-1][1] + 1e-10:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
 def plot_results(f_func, g_func, T, delta, sorted_real_cuts,
-                 J_history, cut_savings, ordered_cuts, baseline_J):
-    """Produce four figures."""
+                 J_history, baseline_J):
+    """
+    Produce two figures.
 
-    x_plot  = np.linspace(0, T, 4000)
-    f_plot  = np.array([float(f_func(x)) for x in x_plot])
-    g_plot  = g_func(x_plot)
-    fg_plot = f_plot * g_plot
+    The pauses are shown as empty gaps in the f and f·g subplots on a
+    wall-clock time axis.  g is plotted continuously (it never pauses).
+    """
+    cuts   = sorted(sorted_real_cuts)
+    pauses = _merge_pauses(cuts, delta)
 
-    gap_colors = plt.cm.tab10.colors
+    total_pause = sum(e - s for s, e in pauses)
+    T_wall      = T + total_pause
 
-    # ── Figure 1: three stacked subplots (f, g, f·g with cuts) ──
+    # ── Active (computation-running) intervals on the wall-clock axis ──
+    active = []
+    prev_end = 0.0
+    for ps, pe in pauses:
+        if ps > prev_end + 1e-10:
+            active.append((prev_end, ps))
+        prev_end = pe
+    if prev_end < T_wall - 1e-10:
+        active.append((prev_end, T_wall))
+
+    # ── Build f and f·g arrays with NaN gaps at pauses ─────────
+    N_PLOT = 8_000
+    x_parts, f_parts, fg_parts = [], [], []
+    job_time = 0.0                          # elapsed computation time
+
+    for ws, we in active:
+        duration = we - ws
+        n_seg   = max(10, int(N_PLOT * duration / T_wall))
+        tw = np.linspace(ws, we, n_seg)
+        tj = job_time + (tw - ws)           # map wall-clock → job time
+
+        fv = np.asarray(f_func(tj), dtype=float)
+        gv = np.asarray(g_func(tw), dtype=float)
+
+        x_parts.append(tw)
+        f_parts.append(fv)
+        fg_parts.append(fv * gv)
+
+        # NaN separator → visual break between segments
+        x_parts.append([np.nan])
+        f_parts.append([np.nan])
+        fg_parts.append([np.nan])
+
+        job_time += duration
+
+    x_wall  = np.concatenate(x_parts)
+    f_wall  = np.concatenate(f_parts)
+    fg_wall = np.concatenate(fg_parts)
+
+    # ── g is continuous on the full wall-clock axis ────────────
+    x_g_cont = np.linspace(0, T_wall, N_PLOT)
+    g_cont   = np.asarray(g_func(x_g_cont), dtype=float)
+
+    # ── Figure 1: three stacked subplots ───────────────────────
     fig, axes = plt.subplots(3, 1, figsize=(16, 13), sharex=True)
 
-    for ax_i, (ydata, ylabel, title, color) in enumerate([
-        (f_plot,  "Power  f(t)  [kW]",
-         "Power profile f(t) with pause intervals", "tab:blue"),
-        (g_plot,  r"Carbon intensity  g(t)  [gCO$_2$eq/kWh]",
-         "Carbon intensity g(t) with pause intervals", "tab:orange"),
-        (fg_plot, r"f(t)$\cdot$g(t)  [gCO$_2$eq·s/kWh·s → gCO$_2$eq]",
-         r"Product f(t)$\cdot$g(t) with pause intervals", "tab:green"),
-    ]):
+    plot_specs = [
+        (x_wall,   f_wall,  "Power  f(t)  [kW]",
+         "Power profile f(t) — pauses shown as gaps", "tab:blue",  "line"),
+        (x_g_cont, g_cont,
+         r"Carbon intensity  g(t)  [gCO$_2$eq/kWh]",
+         "Carbon intensity g(t) (continuous wall-clock)",
+         "tab:orange", "bar"),
+        (x_wall,   fg_wall,
+         r"f(t)$\cdot$g(t)  [gCO$_2$eq·s/kWh·s → gCO$_2$eq]",
+         r"Product f(t)$\cdot$g(t) — pauses shown as gaps",
+         "tab:green", "line"),
+    ]
+
+    for ax_i, (xd, yd, ylabel, title, color, style) in enumerate(plot_specs):
         ax = axes[ax_i]
-        if ax_i == 1:  # bar plot for g
-            bar_width = x_plot[1] - x_plot[0]
-            ax.bar(x_plot, ydata, width=bar_width, color=color,
-                   alpha=0.7, linewidth=0)
+        if style == "bar":
+            bw = xd[1] - xd[0]
+            ax.bar(xd, yd, width=bw, color=color, alpha=0.7, linewidth=0)
         else:
-            ax.plot(x_plot, ydata, color=color, linewidth=1.2)
+            ax.plot(xd, yd, color=color, linewidth=1.2)
         if ax_i == 2:
-            ax.fill_between(x_plot, ydata, alpha=0.08, color=color)
-        for gi, c in enumerate(sorted_real_cuts):
-            col = gap_colors[gi % len(gap_colors)]
-            kw  = dict(alpha=0.30, color=col)
-            if gi < 8:                         # legend only for first few
-                kw["label"] = (f"Pause {gi+1}: "
-                               f"[{c:.0f}, {c+delta:.0f}] s")
-            ax.axvspan(c, c + delta, **kw)
+            ax.fill_between(xd, yd, alpha=0.08, color=color)
+
+        # Shade pause intervals
+        for pi, (ps, pe) in enumerate(pauses):
+            kw = dict(alpha=0.20, color="grey")
+            if pi == 0 and ax_i == 0:
+                kw["label"] = (f"Pauses ({len(pauses)} merged from "
+                               f"{len(cuts)} cuts, "
+                               f"total {total_pause:.0f} s)")
+            ax.axvspan(ps, pe, **kw)
+
         ax.set_ylabel(ylabel, fontsize=11)
         ax.set_title(title, fontsize=12)
         if ax_i == 0:
-            ax.legend(fontsize=8, ncol=2, loc="upper right")
+            ax.legend(fontsize=9, loc="upper right")
         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("Time  t  [s]", fontsize=11)
+    axes[-1].set_xlabel("Wall-clock time  t  [s]", fontsize=11)
     fig.suptitle(
-        f"CO₂-aware pause schedule: {len(sorted_real_cuts)} pauses "
-        f"of δ = {delta:.0f} s",
-        fontsize=14,
+        f"CO₂-aware pause schedule: {len(cuts)} cuts (δ ≈ {delta:.0f} s)  —  "
+        f"wall-clock {T_wall:.0f} s  (job {T:.0f} s + pauses {total_pause:.0f} s)",
+        fontsize=13,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-    # ── Figure 2: cumulative CO₂ saved vs. # of top-impact cuts ──
+    # ── Figure 2: CO₂ cost vs. step number ────────────────────
     fig2, ax2 = plt.subplots(figsize=(10, 5))
-
-    cum_savings   = np.cumsum(cut_savings)
-    n_cuts_range  = np.arange(1, len(cut_savings) + 1)
-
-    ax2.plot(n_cuts_range, baseline_J - cum_savings,
-             "o-", markersize=3, color="tab:red", label="CO₂ cost")
+    step_range = np.arange(1, len(J_history) + 1)
+    ax2.plot(step_range, J_history,
+             "o-", markersize=2, color="tab:red", label="CO₂ cost")
     ax2.axhline(baseline_J, color="grey", linestyle=":", alpha=0.7,
                 label=f"No pauses: {baseline_J:.1f}")
-    ax2.set_xlabel("Number of highest-impact pauses applied", fontsize=11)
+    ax2.set_xlabel("Optimisation step (cuts applied sequentially)", fontsize=11)
     ax2.set_ylabel(r"Total CO$_2$ cost  [gCO$_2$eq·s/kWh]", fontsize=11)
-    ax2.set_title("CO₂ cost vs. number of top-impact pause intervals",
-                  fontsize=13)
+    ax2.set_title("CO₂ cost vs. optimisation step", fontsize=13)
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
     fig2.tight_layout()
@@ -496,14 +515,14 @@ def main():
 
     # ── Optimise ───────────────────────────────────────────────
     print(f"\n[3] Running iterative g-cropping optimisation …\n")
-    sorted_real_cuts, J_history, cut_savings, ordered_cuts, baseline_J = \
+    sorted_real_cuts, J_history, baseline_J, eff_delta = \
         run_optimisation(f_func, g_func, T, delta=DELTA,
                          max_steps=MAX_STEPS, patience=PATIENCE)
 
-    # ── Plot ───────────────────────────────────────────────────
+    # ── Plot ─────────────────────────────────────────────────
     print("\n[4] Plotting results …")
-    plot_results(f_func, g_func, T, DELTA, sorted_real_cuts,
-                 J_history, cut_savings, ordered_cuts, baseline_J)
+    plot_results(f_func, g_func, T, eff_delta, sorted_real_cuts,
+                 J_history, baseline_J)
 
 
 if __name__ == "__main__":
