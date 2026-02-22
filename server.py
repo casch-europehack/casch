@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 from profiler.monitor import profile, extrapolate
 from utils.converters import PowerTranslator, aggregate_intervals
-from services.storage import save_to_db
+from services.storage import save_to_db, load_from_db
 from services.co2_service import co2_service
 
 app = FastAPI(title="Profiler API")
@@ -25,6 +25,19 @@ async def analyze(file: UploadFile = File(...)):
         
     file_hash = hashlib.sha256(content).hexdigest()
 
+    # Check if we already have a stored result
+    existing_data = load_from_db(file_hash)
+    if existing_data:
+        # Clean up the temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        return {
+            "status": "success", 
+            "message": "Returned cached profiling results.", 
+            "file_hash": file_hash,
+            "result": existing_data
+        }
+
     try:
         # --- Process ---
 
@@ -40,9 +53,6 @@ async def analyze(file: UploadFile = File(...)):
             config, 
             out_stem
         )
-
-        # --- Store ---
-        save_to_db(file_hash, output)
 
         # --- Prepare Output ---
         
@@ -64,6 +74,9 @@ async def analyze(file: UploadFile = File(...)):
         
         output["power_timeseries"] = power_timeseries
         output["power_intervals"] = power_intervals
+        
+        # --- Store ---
+        save_to_db(file_hash, output)
         
         return {
             "status": "success", 
