@@ -1,4 +1,17 @@
-# Profiler
+# CaSch
+
+This project is a profiling and scheduling service for machine learning jobs. It analyzes Python scripts to estimate energy consumption, execution time, and carbon emissions, and allows scheduling jobs with specific power-throttling policies to optimize carbon footprint.
+
+## Key Dependencies
+
+This project relies on several important Python packages:
+
+- **[FastAPI](https://fastapi.tiangolo.com/) & [Uvicorn](https://www.uvicorn.org/)**: High-performance framework and server for building the REST API.
+- **[PyTorch](https://pytorch.org/)**: Used for machine learning model execution and profiling.
+- **[Zeus-ML](https://ml.energy/zeus/)**: A framework for deep learning energy measurement and optimization.
+- **[NumPy](https://numpy.org/) & [SciPy](https://scipy.org/)**: Fundamental packages for scientific computing and data manipulation.
+- **[Matplotlib](https://matplotlib.org/)**: Used for plotting and visualizing profiling data.
+- **[Requests](https://requests.readthedocs.io/)**: For making HTTP requests to external services (e.g., Electricity Maps API).
 
 ## Setup
 
@@ -23,47 +36,14 @@ python server.py
 ```
 The server will be available at `http://0.0.0.0:8000`.
 
-## API
+Alternatively, in case you'd like to deploy the client and the server in different networks, execute:
 
-### `POST /analyze`
+```bash
+./start.sh
+```
 
-Upload a Python file to be profiled.
+This will start the server and create an [ngrok](https://ngrok.com/?homepage-cta-docs=test) tunneling channel.
 
-**Request:**
-- `file`: The Python file to profile (multipart/form-data)
+## Example Jobs
 
-**Response:**
-- `status`: "success" or "error"
-- `message`: Status message
-- `file_hash`: SHA-256 hash of the uploaded file
-- `result`: Profiling results including energy and time estimates
-
-### `POST /schedule`
-
-Schedule a training job with a specific throttle policy.
-
-**Request:**
-- `file`: The Python file to execute (multipart/form-data)
-- `location`: The location for the execution (form data)
-- `policy`: The ID of the policy to use from `policies.json` (form data)
-
-**Response:**
-- `status`: "success" or "error"
-- `message`: Status message
-- `result`: Execution data including time, throttle, GPU utilization, and power draw
-
-### `GET /co2`
-
-Get CO2 emissions estimates for a previously profiled file.
-
-**Request:**
-- `file_hash`: The SHA-256 hash returned from the `/analyze` endpoint
-- `location`: The location for which to calculate emissions
-
-**Response:**
-- `status`: "success" or "error"
-- `result`: CO2 emissions data including:
-  - `emissions_per_hour`: Array of hourly CO2 emission values
-  - `times`: Array of timestamps corresponding to the measurements
-  - `total_emissions`: Total CO2 emissions
-  - `location`: The requested location
+There is an example job named `test_job.py` under the jobs directory.
