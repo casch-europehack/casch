@@ -14,6 +14,15 @@ source .venv/bin/activate
 python monitor.py <path_to_user_job.py>
 ```
 
+## Running the Server
+
+To start the FastAPI server, run:
+
+```bash
+python server.py
+```
+The server will be available at `http://0.0.0.0:8000`.
+
 ## API
 
 ### `POST /analyze`
