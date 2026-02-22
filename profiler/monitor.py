@@ -228,6 +228,68 @@ def plot(output: dict, out_stem: str):
     print(f"Plot saved to {plot_path}")
 
 
+def plot_power(output: dict, out_stem: str):
+    step_energies = np.array(output["profiled_step_energy_J"])
+    step_times = np.array(output["profiled_step_time_s"])
+    pred_energies = np.array(output["step_energy_J"])
+    pred_times = np.array(output["step_time_s"])
+    profile_epochs = output["profiled_epochs"]
+    total_epochs = output["total_epochs"]
+    steps_per_epoch = output["steps_per_epoch"]
+    time_mean = output["mean_time_per_step_s"]
+
+    # Calculate power (P = E / t)
+    step_power = step_energies / step_times
+    pred_power = pred_energies / pred_times
+    
+    power_mean = step_power.mean()
+    power_std = step_power.std()
+
+    epoch_times_s = np.array([steps_per_epoch * e * time_mean for e in range(1, total_epochs + 1)])
+
+    assets_dir = Path(__file__).resolve().parent / "assets"
+    assets_dir.mkdir(exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+    # Left: measured per-step power during profiling
+    profiled_times_cum = np.cumsum(step_times)
+    ptime, punit = _time_axis(profiled_times_cum)
+    
+    # Use step plot for power
+    axes[0].step(ptime, step_power, where='post', color="darkorange")
+    axes[0].axhline(power_mean, color="red", linestyle="--", label=f"mean = {power_mean:.2f} W")
+    axes[0].fill_between(ptime,
+                         power_mean - power_std, power_mean + power_std,
+                         alpha=0.2, color="red", label="±1σ", step='post')
+    axes[0].set_xlabel(f"Time ({punit})")
+    axes[0].set_ylabel("Power (W)")
+    axes[0].set_title(f"Measured per-step power — {profile_epochs} epoch(s) profiled")
+    axes[0].legend(loc="upper right")
+
+    # Right: tiled per-step power extrapolated over full training
+    ext_times_cum = np.cumsum(pred_times)
+    ext_time, ext_unit = _time_axis(ext_times_cum)
+    epoch_marks, _ = _time_axis(epoch_times_s)
+    
+    axes[1].step(ext_time, pred_power, where='post', color="darkorange", alpha=0.6)
+    axes[1].axhline(power_mean, color="red", linestyle="--", label=f"mean = {power_mean:.2f} W")
+    axes[1].fill_between(ext_time,
+                         power_mean - power_std, power_mean + power_std,
+                         alpha=0.2, color="red", label="±1σ", step='post')
+    for xb in epoch_marks:
+        axes[1].axvline(xb, color="gray", linestyle="--", alpha=0.4)
+    axes[1].set_xlabel(f"Time ({ext_unit})")
+    axes[1].set_ylabel("Power (W)")
+    axes[1].set_title(f"Projected per-step power — {total_epochs} epochs")
+    axes[1].legend(loc="upper right")
+
+    plt.tight_layout()
+    plot_path = assets_dir / f"{out_stem}_power.png"
+    plt.savefig(plot_path, dpi=150)
+    print(f"Power plot saved to {plot_path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Profile a training job's energy usage.")
     parser.add_argument("script", help="Path to the user job script")
@@ -241,3 +303,4 @@ if __name__ == "__main__":
     step_energies, step_times, steps_per_epoch, config = profile(args.script, profile_epochs=args.epochs, warmup_steps=args.steps, tdp_w=args.default_tdp_w)
     output = extrapolate(step_energies, step_times, steps_per_epoch, config, out_stem, profile_epochs=args.epochs)
     plot(output, out_stem)
+    plot_power(output, out_stem)
