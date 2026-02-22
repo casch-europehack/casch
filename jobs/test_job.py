@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from profiler.models import TrainingJob, JobConfig
+
+from profiler.models import JobConfig, TrainingJob
 
 
 class MyTrainingJob(TrainingJob):
-
     def configure(self) -> JobConfig:
         return JobConfig(
-            total_epochs=40,
+            total_epochs=24,
             gpu_indices=[0],
             profile_steps=50,
         )
@@ -16,12 +16,21 @@ class MyTrainingJob(TrainingJob):
     def setup(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = nn.Sequential(
-            nn.Linear(784, 2048), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(2048, 2048), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(2048, 1024), nn.ReLU(),
-            nn.Linear(1024, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, 10),
+            nn.Linear(784, 5120),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(5120, 5120),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(5120, 5120),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(5120, 5120),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(5120, 5120),
+            nn.ReLU(),
+            nn.Linear(5120, 10),
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.loss_fn = nn.CrossEntropyLoss()
