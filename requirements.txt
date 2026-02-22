@@ -2,6 +2,8 @@ torch
 numpy
 zeus-ml
 matplotlib
+scipy
+requests
 fastapi
 uvicorn
 python-multipart
