@@ -162,6 +162,9 @@ class CO2ProxyService:
             with open(policies_path, "r") as f:
                 policies = json.load(f)
 
+        policies["baseline"] = {
+            "policy": [{"start": 0.0, "end": result["job_duration_s"], "throttle": 1.0}]
+        }
         policies["co2_optimised"] = {"policy": result["policy"]}
 
         with open(policies_path, "w") as f:
