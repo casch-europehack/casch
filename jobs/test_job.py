@@ -8,7 +8,7 @@ from profiler.models import JobConfig, TrainingJob
 class MyTrainingJob(TrainingJob):
     def configure(self) -> JobConfig:
         return JobConfig(
-            total_epochs=24,
+            total_epochs=1,
             gpu_indices=[0],
             profile_steps=50,
         )
