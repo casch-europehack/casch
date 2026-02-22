@@ -109,16 +109,14 @@ class CO2Calculator:
         g_func = create_co2_interpolator(ci_times, ci_values)
 
         # 3. Run the optimisation
-        sorted_real_cuts, J_history, cut_savings, ordered_cuts, baseline_J = (
-            run_optimisation(
-                f_func,
-                g_func,
-                T,
-                delta=delta,
-                max_steps=max_steps,
-                patience=patience,
-                verbose=False,
-            )
+        sorted_real_cuts, J_history, baseline_J, eff_delta = run_optimisation(
+            f_func,
+            g_func,
+            T,
+            delta=delta,
+            max_steps=max_steps,
+            patience=patience,
+            verbose=False,
         )
 
         # 4. Derive final CO₂ cost
@@ -126,13 +124,13 @@ class CO2Calculator:
         savings_abs = baseline_J - final_J
         savings_pct = (savings_abs / baseline_J * 100) if baseline_J else 0.0
 
-        # 5. Convert cuts → throttle policy
-        policy = cuts_to_policy(sorted_real_cuts, delta, T)
+        # 5. Convert cuts → throttle policy (use grid-snapped eff_delta)
+        policy = cuts_to_policy(sorted_real_cuts, eff_delta, T)
 
         return {
             "location": location,
             "job_duration_s": round(T, 2),
-            "delta_s": delta,
+            "delta_s": round(eff_delta, 4),
             "num_pauses": len(sorted_real_cuts),
             "baseline_co2": round(baseline_J, 4),
             "optimised_co2": round(final_J, 4),

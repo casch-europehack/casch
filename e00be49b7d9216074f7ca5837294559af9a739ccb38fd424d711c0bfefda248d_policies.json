@@ -22,58 +22,103 @@
     "policy": [
       {
         "start": 0.0,
-        "end": 1.22,
+        "end": 51.22,
         "throttle": 1.0
       },
       {
-        "start": 1.22,
-        "end": 11.22,
+        "start": 51.22,
+        "end": 61.22,
         "throttle": 0.0
       },
       {
-        "start": 11.22,
-        "end": 20.74,
+        "start": 61.22,
+        "end": 71.22,
         "throttle": 1.0
       },
       {
-        "start": 20.74,
-        "end": 30.74,
+        "start": 71.22,
+        "end": 81.22,
         "throttle": 0.0
       },
       {
-        "start": 30.74,
-        "end": 39.31,
+        "start": 81.22,
+        "end": 91.23,
         "throttle": 1.0
       },
       {
-        "start": 39.31,
-        "end": 49.31,
+        "start": 91.23,
+        "end": 101.23,
         "throttle": 0.0
       },
       {
-        "start": 49.31,
-        "end": 54.57,
+        "start": 101.23,
+        "end": 111.23,
         "throttle": 1.0
       },
       {
-        "start": 54.57,
-        "end": 64.57,
+        "start": 111.23,
+        "end": 121.23,
         "throttle": 0.0
       },
       {
-        "start": 64.57,
-        "end": 71.49,
+        "start": 121.23,
+        "end": 131.23,
         "throttle": 1.0
       },
       {
-        "start": 71.49,
-        "end": 81.49,
+        "start": 131.23,
+        "end": 141.23,
         "throttle": 0.0
       },
       {
-        "start": 81.49,
-        "end": 101.22,
+        "start": 141.23,
+        "end": 151.24,
         "throttle": 1.0
+      },
+      {
+        "start": 151.24,
+        "end": 161.24,
+        "throttle": 0.0
+      },
+      {
+        "start": 161.24,
+        "end": 171.24,
+        "throttle": 1.0
+      },
+      {
+        "start": 171.24,
+        "end": 181.24,
+        "throttle": 0.0
+      },
+      {
+        "start": 181.24,
+        "end": 191.24,
+        "throttle": 1.0
+      },
+      {
+        "start": 191.24,
+        "end": 201.25,
+        "throttle": 0.0
+      },
+      {
+        "start": 201.25,
+        "end": 211.25,
+        "throttle": 1.0
+      },
+      {
+        "start": 211.25,
+        "end": 221.25,
+        "throttle": 0.0
+      },
+      {
+        "start": 221.25,
+        "end": 231.25,
+        "throttle": 1.0
+      },
+      {
+        "start": 231.25,
+        "end": 241.25,
+        "throttle": 0.0
       }
     ]
   }
