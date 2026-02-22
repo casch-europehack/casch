@@ -1,11 +1,13 @@
 import hashlib
 import os
 import tempfile
+import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 from profiler.monitor import extrapolate, profile
@@ -110,6 +112,76 @@ async def get_co2(file_hash: str, location: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/schedule")
+async def schedule(
+    file: UploadFile = File(...),
+    location: str = Form(...),
+    policy: str = Form(...)
+):
+    if not file.filename.endswith(".py"):
+        raise HTTPException(status_code=400, detail="Only Python files are supported.")
+
+    # Save the uploaded file to a temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as temp_file:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file_path = temp_file.name
+
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    try:
+        # Load the policy from the policies.json file
+        policies_file = f"{file_hash}_policies.json"
+        if not os.path.exists(policies_file):
+            raise HTTPException(status_code=500, detail=f"{policies_file} not found.")
+            
+        with open(policies_file, "r") as f:
+            policies = json.load(f)
+            
+        if policy not in policies:
+            raise HTTPException(status_code=404, detail=f"Policy '{policy}' not found.")
+            
+        policy_str = policies[policy]["policy"]
+        
+        out_stem = Path(file.filename).stem
+        
+        # Run the executor
+        cmd = [
+            "python", "-m", "executor.executor", 
+            temp_file_path, 
+            "--policy", policy_str, 
+            "--out", out_stem
+        ]
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if process.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Executor failed: {process.stderr}")
+            
+        # Read the output from the executor
+        assets_dir = Path("profiler/assets")
+        json_path = assets_dir / f"{out_stem}_execution.json"
+        
+        if not json_path.exists():
+            raise HTTPException(status_code=500, detail="Executor did not produce output JSON.")
+            
+        with open(json_path, "r") as f:
+            execution_data = json.load(f)
+            
+        return {
+            "status": "success",
+            "message": "Scheduling completed successfully.",
+            "result": execution_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

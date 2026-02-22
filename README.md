@@ -38,6 +38,20 @@ Upload a Python file to be profiled.
 - `file_hash`: SHA-256 hash of the uploaded file
 - `result`: Profiling results including energy and time estimates
 
+### `POST /schedule`
+
+Schedule a training job with a specific throttle policy.
+
+**Request:**
+- `file`: The Python file to execute (multipart/form-data)
+- `location`: The location for the execution (form data)
+- `policy`: The ID of the policy to use from `policies.json` (form data)
+
+**Response:**
+- `status`: "success" or "error"
+- `message`: Status message
+- `result`: Execution data including time, throttle, GPU utilization, and power draw
+
 ### `GET /co2`
 
 Get CO2 emissions estimates for a previously profiled file.
