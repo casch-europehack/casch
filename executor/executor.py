@@ -52,8 +52,9 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import numpy as np
-from profiler.models import TrainingJob, JobConfig  # noqa: E402
+
 from executor.plotter import plot_execution
+from profiler.models import JobConfig, TrainingJob  # noqa: E402
 
 try:
     import pynvml as _pynvml
@@ -205,20 +206,25 @@ class ExecutionMonitor:
     # Output
     # ------------------------------------------------------------------
 
-    def save(self, out_stem: str, config: Optional[JobConfig] = None, steps_per_epoch: Optional[int] = None) -> None:
+    def save(
+        self,
+        out_stem: str,
+        config: Optional[JobConfig] = None,
+        steps_per_epoch: Optional[int] = None,
+    ) -> None:
         """Save recorded samples as JSON and a PNG plot."""
         assets_dir = Path(__file__).resolve().parent.parent / "profiler" / "assets"
         assets_dir.mkdir(exist_ok=True)
 
         # ── JSON ────────────────────────────────────────────────────────
         json_path = assets_dir / f"{out_stem}_execution.json"
-        
+
         # Transform execution data to match extrapolate output format
         step_energies = []
         step_times = []
         throttles = []
         for i in range(1, len(self._samples)):
-            dt = self._samples[i].time_s - self._samples[i-1].time_s
+            dt = self._samples[i].time_s - self._samples[i - 1].time_s
             if dt <= 0:
                 continue
             power = self._samples[i].power_w
@@ -227,16 +233,16 @@ class ExecutionMonitor:
             step_times.append(dt)
             step_energies.append(power * dt)
             throttles.append(self._samples[i].throttle)
-            
+
         energy_mean = np.mean(step_energies) if step_energies else 0.0
         energy_std = np.std(step_energies) if step_energies else 0.0
         time_mean = np.mean(step_times) if step_times else 0.0
         time_std = np.std(step_times) if step_times else 0.0
         total_steps = len(step_energies)
-        
+
         total_epochs = config.total_epochs if config else 1
         spe = steps_per_epoch if steps_per_epoch else total_steps
-            
+
         output = {
             "profiled_epochs": 1,
             "steps_per_epoch": spe,
@@ -252,9 +258,9 @@ class ExecutionMonitor:
             "profiled_step_time_s": [round(t, 6) for t in step_times],
             "step_energy_J": [round(e, 4) for e in step_energies],
             "step_time_s": [round(t, 6) for t in step_times],
-            "throttles": throttles
+            "throttles": throttles,
         }
-        
+
         with open(json_path, "w") as f:
             json.dump(output, f, indent=2)
         print(f"[Monitor] Data saved → {json_path}")
@@ -445,7 +451,7 @@ class Executor:
             if self.monitor is not None:
                 self.monitor.stop()
             job.teardown()
-            
+
         return config, len(loader)
 
 
@@ -542,5 +548,4 @@ Examples:
     executor = Executor(policy=policy, gpu_indices=args.gpus, monitor=monitor)
     config, steps_per_epoch = executor.run(job)
     monitor.save(out_stem, config, steps_per_epoch)
-    plot_execution(executor._samples, out_stem)
-
+    plot_execution(monitor._samples, out_stem)

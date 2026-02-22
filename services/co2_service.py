@@ -178,9 +178,9 @@ class CO2ProxyService:
         reducing CO2.  The returned arrays let the frontend plot
         *duration* on the X-axis and *CO2 emissions* on the Y-axis.
 
-        Also stores a small set of schedulable policies (baseline,
-        optimal, and a few intermediate milestones) so that the
-        ``/schedule`` endpoint can execute them.
+        A schedulable policy is generated and stored for **every**
+        optimisation step so that any point on the curve can be
+        executed via the ``/schedule`` endpoint.
 
         Returns
         -------
@@ -203,8 +203,14 @@ class CO2ProxyService:
         )
         g_func = create_co2_interpolator(ci_times, ci_values)
 
-        # 2. Run the optimisation
-        sorted_real_cuts, J_history, baseline_J, eff_delta = run_optimisation(
+        # 2. Run the optimisation, recording intermediate cut snapshots
+        (
+            sorted_real_cuts,
+            J_history,
+            baseline_J,
+            eff_delta,
+            cuts_history,
+        ) = run_optimisation(
             f_func,
             g_func,
             T,
@@ -213,6 +219,7 @@ class CO2ProxyService:
             max_steps=MAX_STEPS,
             patience=PATIENCE,
             verbose=False,
+            record_cuts_history=True,
         )
 
         # 3. Build the trade-off curve from J_history
@@ -231,7 +238,7 @@ class CO2ProxyService:
             co2_emissions.append(round(float(running_min), 4))
             policy_ids.append(f"step_{k + 1}")
 
-        # 4. Generate & store schedulable policies at key milestones
+        # 4. Generate & store a policy for every optimisation step
         n_optimal = len(sorted_real_cuts)
         optimal_co2 = co2_emissions[-1] if co2_emissions else round(baseline_J, 4)
 
@@ -246,23 +253,19 @@ class CO2ProxyService:
             "policy": [{"start": 0.0, "end": round(T, 2), "throttle": 1.0}]
         }
 
-        # Full optimal policy
-        optimal_policy = cuts_to_policy(sorted_real_cuts, eff_delta, T)
-        policies["co2_optimised"] = {"policy": optimal_policy}
+        # One policy per optimisation step
+        for k, step_cuts in enumerate(cuts_history):
+            key = f"step_{k + 1}"
+            policies[key] = {
+                "policy": cuts_to_policy(step_cuts, eff_delta, T),
+                "num_pauses": len(step_cuts),
+                "duration_s": round(float(T + len(step_cuts) * eff_delta), 2),
+            }
 
-        # Intermediate milestone policies at 25%, 50%, 75% of cuts
-        if n_optimal > 1:
-            for pct in (25, 50, 75):
-                n_cuts = max(1, int(round(n_optimal * pct / 100)))
-                if n_cuts >= n_optimal:
-                    continue
-                subset = sorted_real_cuts[:n_cuts]
-                key = f"co2_{pct}pct"
-                policies[key] = {
-                    "policy": cuts_to_policy(subset, eff_delta, T),
-                    "num_pauses": n_cuts,
-                    "duration_s": round(T + n_cuts * eff_delta, 2),
-                }
+        # Alias the final optimal policy for backwards compatibility
+        policies["co2_optimised"] = {
+            "policy": cuts_to_policy(sorted_real_cuts, eff_delta, T),
+        }
 
         with open(policies_path, "w") as f:
             json.dump(policies, f, indent=2)

@@ -39,12 +39,12 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 JSON_PATH = DATA_DIR / "real_data.json"
 CI_CACHE_PATH = DATA_DIR / "ci_cache.json"
 
-JOB_DURATION  = 8_000.0      # seconds – the job timestamp
-DELTA         = 10.0          # seconds – width of each pause window
-MAX_STEPS     = 800         # maximum number of cut-out attempts
-PATIENCE      = 80             # early-stop after this many non-improving cuts
-MIN_IMPROVE   = 1e-6          # stop when marginal improvement < this fraction
-N_INTERP      = 8_000         # interpolation grid resolution
+JOB_DURATION = 8_000.0  # seconds – the job timestamp
+DELTA = 10.0  # seconds – width of each pause window
+MAX_STEPS = 800  # maximum number of cut-out attempts
+PATIENCE = 80  # early-stop after this many non-improving cuts
+MIN_IMPROVE = 1e-6  # stop when marginal improvement < this fraction
+N_INTERP = 8_000  # interpolation grid resolution
 
 
 # ────────────────────────────────────────────────────────────────
@@ -258,6 +258,7 @@ def run_optimisation(
     patience: int = PATIENCE,
     n_interp: int = N_INTERP,
     verbose: bool = True,
+    record_cuts_history: bool = False,
 ):
     """
     Iteratively crop δ-wide windows from g to minimise ∫₀ᵀ f·g.
@@ -275,6 +276,9 @@ def run_optimisation(
         Original ∫ f·g with no pauses.
     eff_delta : float
         Effective δ after grid-snapping.
+    cuts_history : list[list[float]] or None
+        Only present when *record_cuts_history* is True.  ``cuts_history[k]``
+        is a sorted copy of all cut positions after optimisation step *k+1*.
     """
     # ── Discretise f and g ─────────────────────────────────────
     x_grid = np.linspace(0, T, n_interp)
@@ -287,7 +291,7 @@ def run_optimisation(
 
     # g extends beyond T so values can slide in as cuts accumulate,
     # but never beyond the end of the actual g data.
-    g_max_pts = int(g_end_time / h) + 1          # hard cap from g data
+    g_max_pts = int(g_end_time / h) + 1  # hard cap from g data
     g_len = min(N + (max_steps + 1) * delta_idx, g_max_pts)
     x_g = np.arange(g_len) * h
     g_arr = np.asarray(g_func(x_g), dtype=np.float64).copy()
@@ -296,6 +300,7 @@ def run_optimisation(
 
     sorted_real_cuts = []
     J_history = []
+    cuts_history = [] if record_cuts_history else None
     no_improve_count = 0
     best_J = baseline_J
     best_real_cuts = []
@@ -325,7 +330,7 @@ def run_optimisation(
         max_idx = min(N, int(max_compressed / h) + 1)
         if max_idx <= 0:
             if verbose:
-                print(f"  Step {step_i+1}: g data range exhausted, stopping.")
+                print(f"  Step {step_i + 1}: g data range exhausted, stopping.")
             break
         margin = max(0, N - max_idx)
         # During patience: also exclude boundary to force interior exploration
@@ -340,6 +345,9 @@ def run_optimisation(
         sorted_real_cuts.sort()
 
         J_history.append(J_val)
+
+        if cuts_history is not None:
+            cuts_history.append(list(sorted_real_cuts))
 
         # Track best schedule seen
         if J_val < best_J - 1e-12:
@@ -357,11 +365,15 @@ def run_optimisation(
         ):
             tag = ""
             if no_improve_count > 0:
-                tag = (f" [no improve {no_improve_count}/{patience}, "
-                       f"current J={J_val:.4f}]")
-            print(f"  Step {step_i+1}: a_real={real_a:.1f} s, "
-                  f"best_J={best_J:.4f}, saved {baseline_J - best_J:.4f} "
-                  f"({(baseline_J - best_J)/baseline_J*100:.2f}%){tag}")
+                tag = (
+                    f" [no improve {no_improve_count}/{patience}, "
+                    f"current J={J_val:.4f}]"
+                )
+            print(
+                f"  Step {step_i + 1}: a_real={real_a:.1f} s, "
+                f"best_J={best_J:.4f}, saved {baseline_J - best_J:.4f} "
+                f"({(baseline_J - best_J) / baseline_J * 100:.2f}%){tag}"
+            )
 
         # ── Stitch g: always apply the cut so subsequent iterations
         #    see a different landscape (needed to escape local optima) ──
@@ -394,6 +406,8 @@ def run_optimisation(
             f"{(baseline_J - final_J) / baseline_J * 100:.2f}%)"
         )
 
+    if record_cuts_history:
+        return sorted_real_cuts, J_history, baseline_J, eff_delta, cuts_history
     return sorted_real_cuts, J_history, baseline_J, eff_delta
 
 
@@ -431,7 +445,7 @@ def plot_results(f_func, g_func, T, delta, sorted_real_cuts, J_history, baseline
     """
     cuts = sorted(sorted_real_cuts)
     n_cuts = len(cuts)
-    total_pause = n_cuts * delta          # exact: each cut adds delta
+    total_pause = n_cuts * delta  # exact: each cut adds delta
     T_wall = T + total_pause
 
     # ── Map job-time grid → wall-clock via compressed_to_real ──
@@ -456,8 +470,9 @@ def plot_results(f_func, g_func, T, delta, sorted_real_cuts, J_history, baseline
     jump_idx = np.where(dt > 1.5 * h_plot)[0]
 
     # Wall-clock pause intervals for grey shading
-    pause_intervals = [(float(t_wall_arr[i]), float(t_wall_arr[i + 1]))
-                       for i in jump_idx]
+    pause_intervals = [
+        (float(t_wall_arr[i]), float(t_wall_arr[i + 1])) for i in jump_idx
+    ]
     # Merge intervals that are nearly adjacent (< 2 grid cells apart)
     merged_pi: list[tuple[float, float]] = []
     for s, e in pause_intervals:
@@ -606,9 +621,13 @@ def main():
     # ── Optimise ───────────────────────────────────────────────
     print(f"\n[3] Running iterative g-cropping optimisation …\n")
     sorted_real_cuts, J_history, baseline_J, eff_delta = run_optimisation(
-        f_func, g_func, T,
+        f_func,
+        g_func,
+        T,
         g_end_time=float(ci_times[-1]),
-        delta=DELTA, max_steps=MAX_STEPS, patience=PATIENCE
+        delta=DELTA,
+        max_steps=MAX_STEPS,
+        patience=PATIENCE,
     )
 
     # ── Plot ─────────────────────────────────────────────────
