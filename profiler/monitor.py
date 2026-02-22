@@ -15,18 +15,11 @@ import numpy as np
 import torch
 from profiler.models import TrainingJob, JobConfig
 
+# Number of initial steps to discard as warmup (e.g. for JIT compilation, caching, etc.)
 WARMUP_STEPS = 5
+
+# Fallback TDP in watts for time-based energy estimates when no GPU is available (e.g. CPU-only). Adjust as needed.
 DEFAULT_TDP_W = 250
-
-
-def _zeus_available():
-    try:
-        from zeus.monitor import ZeusMonitor
-        ZeusMonitor(gpu_indices=[0])
-        return True
-    except Exception:
-        return False
-
 
 class _FallbackResult:
     """Time-based energy estimate when Zeus is unavailable (no NVIDIA/AMD GPU)."""
@@ -46,8 +39,17 @@ class _FallbackMonitor:
         elapsed = time.perf_counter() - self._start
         return _FallbackResult(elapsed, self._tdp_w)
 
-
-def load_job(script_path: str) -> TrainingJob:
+def _load_job(script_path: str) -> TrainingJob:
+    """
+    Dynamically load the user script and find the TrainingJob subclass.
+    
+    Args:
+        script_path: Path to the user job script.
+    Returns:
+        An instance of the TrainingJob subclass defined in the user script.
+    Raises:
+        ValueError: If no TrainingJob subclass is found or if multiple are found.
+    """
     spec = importlib.util.spec_from_file_location("user_job", script_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -65,7 +67,7 @@ def load_job(script_path: str) -> TrainingJob:
 
 
 def profile(script_path: str, profile_epochs: int = 1, warmup_steps: int = WARMUP_STEPS, tdp_w: float = DEFAULT_TDP_W):
-    job = load_job(script_path)
+    job = _load_job(script_path)
     config: JobConfig = job.configure()
 
     job.setup()
@@ -73,10 +75,10 @@ def profile(script_path: str, profile_epochs: int = 1, warmup_steps: int = WARMU
     steps_per_epoch = len(loader)
     total_profile_steps = steps_per_epoch * profile_epochs
 
-    if _zeus_available():
+    try:
         from zeus.monitor import ZeusMonitor
         monitor = ZeusMonitor(gpu_indices=config.gpu_indices)
-    else:
+    except Exception:
         print("WARNING: No supported GPU found, using time-based energy estimates.")
         monitor = _FallbackMonitor(tdp_w=tdp_w)
 
