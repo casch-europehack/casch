@@ -10,9 +10,10 @@ _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from profiler.models import TrainingJob, JobConfig
 
 # Number of initial steps to discard as warmup (e.g. for JIT compilation, caching, etc.)
@@ -116,7 +117,7 @@ def _time_axis(seconds: np.ndarray):
     return seconds, "s"
 
 
-def extrapolate_and_plot(
+def extrapolate(
     step_energies: np.ndarray,
     step_times: np.ndarray,
     steps_per_epoch: int,
@@ -132,9 +133,6 @@ def extrapolate_and_plot(
 
     cum_time_s = time_mean * np.arange(1, total_steps + 1)
     cumulative_energy = energy_mean * np.arange(1, total_steps + 1) / 3600
-    upper_energy = (energy_mean + energy_std) * np.arange(1, total_steps + 1) / 3600
-    lower_energy = (energy_mean - energy_std) * np.arange(1, total_steps + 1) / 3600
-    epoch_times_s = np.array([steps_per_epoch * e * time_mean for e in range(1, config.total_epochs + 1)])
 
     reps = int(np.ceil(total_steps / len(step_energies)))
     pred_energies = np.tile(step_energies, reps)[:total_steps]
@@ -156,11 +154,42 @@ def extrapolate_and_plot(
         "step_energy_J": [round(e, 4) for e in pred_energies.tolist()],
         "step_time_s": [round(t, 6) for t in pred_times.tolist()],
     }
+
+    return output
+
+
+def plot(output: dict, out_stem: str):
+    step_energies = np.array(output["profiled_step_energy_J"])
+    step_times = np.array(output["profiled_step_time_s"])
+    pred_energies = np.array(output["step_energy_J"])
+    pred_times = np.array(output["step_time_s"])
+    energy_mean = output["mean_energy_per_step_J"]
+    energy_std = output["std_energy_per_step_J"]
+    profile_epochs = output["profiled_epochs"]
+    total_epochs = output["total_epochs"]
+    total_steps = output["total_steps"]
+    steps_per_epoch = output["steps_per_epoch"]
+    time_mean = output["mean_time_per_step_s"]
+    estimated_total_energy_Wh = output["estimated_total_energy_Wh"]
+    estimated_total_time_s = output["estimated_total_time_s"]
+
+    upper_energy = (energy_mean + energy_std) * np.arange(1, total_steps + 1) / 3600
+    lower_energy = (energy_mean - energy_std) * np.arange(1, total_steps + 1) / 3600
+
     assets_dir = Path(__file__).resolve().parent / "assets"
     assets_dir.mkdir(exist_ok=True)
     json_path = assets_dir / f"{out_stem}_profile.json"
     with open(json_path, "w") as f:
         json.dump(output, f, indent=2)
+
+    print(f"Results saved to {json_path}")
+    print(f"\nEstimated total energy: {estimated_total_energy_Wh:.2f} Wh  (±{(upper_energy[-1]-lower_energy[-1])/2:.2f} Wh)")
+    print(f"Estimated total time: {estimated_total_time_s:.1f} s")
+
+    epoch_times_s = np.array([steps_per_epoch * e * time_mean for e in range(1, total_epochs + 1)])
+
+    assets_dir = Path(__file__).resolve().parent / "assets"
+    assets_dir.mkdir(exist_ok=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
 
@@ -190,16 +219,13 @@ def extrapolate_and_plot(
         axes[1].axvline(xb, color="gray", linestyle="--", alpha=0.4)
     axes[1].set_xlabel(f"Time ({ext_unit})")
     axes[1].set_ylabel("Energy (J)")
-    axes[1].set_title(f"Projected per-step energy — {config.total_epochs} epochs")
+    axes[1].set_title(f"Projected per-step energy — {total_epochs} epochs")
     axes[1].legend(loc="upper right")
 
     plt.tight_layout()
     plot_path = assets_dir / f"{out_stem}_energy.png"
     plt.savefig(plot_path, dpi=150)
     print(f"Plot saved to {plot_path}")
-    print(f"Results saved to {json_path}")
-    print(f"\nEstimated total energy: {cumulative_energy[-1]:.2f} Wh  (±{(upper_energy[-1]-lower_energy[-1])/2:.2f} Wh)")
-    print(f"Estimated total time: {cum_time_s[-1]:.1f} s")
 
 
 if __name__ == "__main__":
@@ -213,4 +239,5 @@ if __name__ == "__main__":
     out_stem = Path(args.script).stem
 
     step_energies, step_times, steps_per_epoch, config = profile(args.script, profile_epochs=args.epochs, warmup_steps=args.steps, tdp_w=args.default_tdp_w)
-    extrapolate_and_plot(step_energies, step_times, steps_per_epoch, config, out_stem, profile_epochs=args.epochs)
+    output = extrapolate(step_energies, step_times, steps_per_epoch, config, out_stem, profile_epochs=args.epochs)
+    plot(output, out_stem)

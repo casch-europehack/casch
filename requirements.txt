@@ -2,3 +2,6 @@ torch
 numpy
 zeus-ml
 matplotlib
+fastapi
+uvicorn
+python-multipart
