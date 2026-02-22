@@ -41,8 +41,8 @@ CI_CACHE_PATH = DATA_DIR / "ci_cache.json"
 
 JOB_DURATION  = 8_000.0      # seconds – the job timestamp
 DELTA         = 10.0          # seconds – width of each pause window
-MAX_STEPS     = 1_000         # maximum number of cut-out attempts
-PATIENCE      = 50             # early-stop after this many non-improving cuts
+MAX_STEPS     = 800         # maximum number of cut-out attempts
+PATIENCE      = 80             # early-stop after this many non-improving cuts
 MIN_IMPROVE   = 1e-6          # stop when marginal improvement < this fraction
 N_INTERP      = 8_000         # interpolation grid resolution
 
@@ -253,6 +253,7 @@ def run_optimisation(
     f_func,
     g_func,
     T: float,
+    g_end_time: float = float("inf"),
     delta: float = DELTA,
     max_steps: int = MAX_STEPS,
     patience: int = PATIENCE,
@@ -285,8 +286,10 @@ def run_optimisation(
 
     f_arr = np.asarray(f_func(x_grid), dtype=np.float64)
 
-    # g extends well beyond T so values can slide in as cuts accumulate
-    g_len = N + (max_steps + 1) * delta_idx
+    # g extends beyond T so values can slide in as cuts accumulate,
+    # but never beyond the end of the actual g data.
+    g_max_pts = int(g_end_time / h) + 1          # hard cap from g data
+    g_len = min(N + (max_steps + 1) * delta_idx, g_max_pts)
     x_g = np.arange(g_len) * h
     g_arr = np.asarray(g_func(x_g), dtype=np.float64).copy()
 
@@ -315,10 +318,21 @@ def run_optimisation(
             break
 
         # ── Find the best single cut on current g ─────────────
-        # During patience: exclude boundary (last delta_idx indices)
-        # to avoid trivial zero-effect cuts and force interior exploration.
-        m = delta_idx if no_improve_count > 0 else 0
-        cut_idx, J_val = find_best_cut(f_arr, g_arr, h, delta_idx, margin=m)
+        # Clamp search so real-time position stays within g data range.
+        # After k cuts, compressed index i maps to real ≈ i*h + k*eff_delta.
+        # We need  i*h + (k+1)*eff_delta ≤ g_end_time  (pause must end within g).
+        n_cuts_so_far = len(sorted_real_cuts)
+        max_compressed = g_end_time - (n_cuts_so_far + 1) * eff_delta
+        max_idx = min(N, int(max_compressed / h) + 1)
+        if max_idx <= 0:
+            if verbose:
+                print(f"  Step {step_i+1}: g data range exhausted, stopping.")
+            break
+        margin = max(0, N - max_idx)
+        # During patience: also exclude boundary to force interior exploration
+        if no_improve_count > 0:
+            margin = max(margin, delta_idx)
+        cut_idx, J_val = find_best_cut(f_arr, g_arr, h, delta_idx, margin=margin)
 
         # Map compressed-domain index → original g time
         a_s = cut_idx * h
@@ -409,47 +423,62 @@ def plot_results(f_func, g_func, T, delta, sorted_real_cuts, J_history, baseline
 
     The pauses are shown as empty gaps in the f and f·g subplots on a
     wall-clock time axis.  g is plotted continuously (it never pauses).
+
+    Wall-clock reconstruction: each cut at original-g position *c*
+    contributes *delta* seconds of idle time.  The mapping from job-
+    time to wall-clock is computed via the vectorised form of
+    ``compressed_to_real`` so that every cut is accounted for exactly
+    once (no lost overlap).
     """
     cuts = sorted(sorted_real_cuts)
-    pauses = _merge_pauses(cuts, delta)
-
-    total_pause = sum(e - s for s, e in pauses)
+    n_cuts = len(cuts)
+    total_pause = n_cuts * delta          # exact: each cut adds delta
     T_wall = T + total_pause
 
-    # ── Active (computation-running) intervals on the wall-clock axis ──
-    active = []
-    prev_end = 0.0
-    for ps, pe in pauses:
-        if ps > prev_end + 1e-10:
-            active.append((prev_end, ps))
-        prev_end = pe
-    if prev_end < T_wall - 1e-10:
-        active.append((prev_end, T_wall))
-
-    # ── Build f and f·g arrays with NaN gaps at pauses ─────────
+    # ── Map job-time grid → wall-clock via compressed_to_real ──
     N_PLOT = 8_000
+    t_job = np.linspace(0, T, N_PLOT)
+    h_plot = t_job[1] - t_job[0] if N_PLOT > 1 else 1.0
+
+    # Vectorised compressed_to_real:
+    #   for each real cut c (sorted ascending), every t_wall entry
+    #   that has already reached c gets shifted right by delta.
+    t_wall_arr = t_job.astype(np.float64).copy()
+    for c in cuts:
+        t_wall_arr += np.where(t_wall_arr >= c, delta, 0.0)
+
+    # ── Evaluate f at job-times, g at wall-clock times ─────────
+    f_vals = np.asarray(f_func(t_job), dtype=np.float64)
+    g_at_wc = np.asarray(g_func(t_wall_arr), dtype=np.float64)
+    fg_vals = f_vals * g_at_wc
+
+    # ── Detect pauses (jumps in t_wall larger than ~1.5 h) ─────
+    dt = np.diff(t_wall_arr)
+    jump_idx = np.where(dt > 1.5 * h_plot)[0]
+
+    # Wall-clock pause intervals for grey shading
+    pause_intervals = [(float(t_wall_arr[i]), float(t_wall_arr[i + 1]))
+                       for i in jump_idx]
+    # Merge intervals that are nearly adjacent (< 2 grid cells apart)
+    merged_pi: list[tuple[float, float]] = []
+    for s, e in pause_intervals:
+        if merged_pi and s - merged_pi[-1][1] < 2 * h_plot:
+            merged_pi[-1] = (merged_pi[-1][0], e)
+        else:
+            merged_pi.append((s, e))
+
+    # ── Build plot arrays with NaN gaps at pauses ──────────────
+    split_at = jump_idx + 1
+    tw_segs = np.split(t_wall_arr, split_at)
+    f_segs = np.split(f_vals, split_at)
+    fg_segs = np.split(fg_vals, split_at)
+
+    nan1 = np.array([np.nan])
     x_parts, f_parts, fg_parts = [], [], []
-    job_time = 0.0  # elapsed computation time
-
-    for ws, we in active:
-        duration = we - ws
-        n_seg = max(10, int(N_PLOT * duration / T_wall))
-        tw = np.linspace(ws, we, n_seg)
-        tj = job_time + (tw - ws)  # map wall-clock → job time
-
-        fv = np.asarray(f_func(tj), dtype=float)
-        gv = np.asarray(g_func(tw), dtype=float)
-
-        x_parts.append(tw)
-        f_parts.append(fv)
-        fg_parts.append(fv * gv)
-
-        # NaN separator → visual break between segments
-        x_parts.append([np.nan])
-        f_parts.append([np.nan])
-        fg_parts.append([np.nan])
-
-        job_time += duration
+    for tw_s, f_s, fg_s in zip(tw_segs, f_segs, fg_segs):
+        x_parts.extend([tw_s, nan1])
+        f_parts.extend([f_s, nan1])
+        fg_parts.extend([fg_s, nan1])
 
     x_wall = np.concatenate(x_parts)
     f_wall = np.concatenate(f_parts)
@@ -457,7 +486,7 @@ def plot_results(f_func, g_func, T, delta, sorted_real_cuts, J_history, baseline
 
     # ── g is continuous on the full wall-clock axis ────────────
     x_g_cont = np.linspace(0, T_wall, N_PLOT)
-    g_cont = np.asarray(g_func(x_g_cont), dtype=float)
+    g_cont = np.asarray(g_func(x_g_cont), dtype=np.float64)
 
     # ── Figure 1: three stacked subplots ───────────────────────
     fig, axes = plt.subplots(3, 1, figsize=(16, 13), sharex=True)
@@ -500,12 +529,12 @@ def plot_results(f_func, g_func, T, delta, sorted_real_cuts, J_history, baseline
             ax.fill_between(xd, yd, alpha=0.08, color=color)
 
         # Shade pause intervals
-        for pi, (ps, pe) in enumerate(pauses):
+        for pi, (ps, pe) in enumerate(merged_pi):
             kw = dict(alpha=0.20, color="grey")
             if pi == 0 and ax_i == 0:
                 kw["label"] = (
-                    f"Pauses ({len(pauses)} merged from "
-                    f"{len(cuts)} cuts, "
+                    f"Pauses ({len(merged_pi)} intervals from "
+                    f"{n_cuts} cuts, "
                     f"total {total_pause:.0f} s)"
                 )
             ax.axvspan(ps, pe, **kw)
@@ -518,7 +547,7 @@ def plot_results(f_func, g_func, T, delta, sorted_real_cuts, J_history, baseline
 
     axes[-1].set_xlabel("Wall-clock time  t  [s]", fontsize=11)
     fig.suptitle(
-        f"CO₂-aware pause schedule: {len(cuts)} cuts (δ ≈ {delta:.0f} s)  —  "
+        f"CO₂-aware pause schedule: {n_cuts} cuts (δ ≈ {delta:.0f} s)  —  "
         f"wall-clock {T_wall:.0f} s  (job {T:.0f} s + pauses {total_pause:.0f} s)",
         fontsize=13,
     )
@@ -578,7 +607,9 @@ def main():
     # ── Optimise ───────────────────────────────────────────────
     print(f"\n[3] Running iterative g-cropping optimisation …\n")
     sorted_real_cuts, J_history, baseline_J, eff_delta = run_optimisation(
-        f_func, g_func, T, delta=DELTA, max_steps=MAX_STEPS, patience=PATIENCE
+        f_func, g_func, T,
+        g_end_time=float(ci_times[-1]),
+        delta=DELTA, max_steps=MAX_STEPS, patience=PATIENCE
     )
 
     # ── Plot ─────────────────────────────────────────────────
