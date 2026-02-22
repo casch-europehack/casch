@@ -118,7 +118,6 @@ def fetch_and_cache_carbon_intensity(cache_path: str | Path, zone: str = "US-TEX
             cached = json.load(fh)
         return np.array(cached["times_seconds"]), np.array(cached["ci_values"])
 
-    # ── Live fetch ─────────────────────────────────────────────
     from datetime import datetime
 
     import requests

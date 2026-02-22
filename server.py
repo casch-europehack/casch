@@ -4,10 +4,12 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+import requests
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -15,6 +17,9 @@ from profiler.monitor import extrapolate, profile
 from services.co2_service import co2_service
 from services.storage import load_from_db, save_to_db
 from utils.converters import PowerTranslator, aggregate_intervals
+
+ELECTRICITYMAPS_TOKEN = "4N4rpoLvWqfvQ0yJdHN0"
+ELECTRICITYMAPS_BASE = "https://api.electricitymaps.com/v3"
 
 app = FastAPI(title="Profiler API")
 
@@ -24,6 +29,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/carbon-intensity")
+async def carbon_intensity(zones: str = Query(..., description="Comma-separated zone codes")):
+    """
+    Fetch the latest carbon intensity (gCO₂eq/kWh) for each requested zone
+    from the Electricity Maps API.
+
+    Example: GET /carbon-intensity?zones=IE,PL,DE,FR
+    """
+    zone_list = [z.strip() for z in zones.split(",") if z.strip()]
+    if not zone_list:
+        raise HTTPException(status_code=400, detail="No zones provided.")
+
+    headers = {"auth-token": ELECTRICITYMAPS_TOKEN}
+    result: dict[str, Optional[int]] = {}
+
+    for zone in zone_list:
+        try:
+            resp = requests.get(
+                f"{ELECTRICITYMAPS_BASE}/carbon-intensity/latest",
+                params={"zone": zone},
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result[zone] = round(data.get("carbonIntensity", 0))
+        except Exception as e:
+            print(f"Failed to fetch carbon intensity for {zone}: {e}")
+            result[zone] = None
+
+    return JSONResponse(
+        content={"status": "success", "result": result},
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.post("/analyze")
