@@ -39,12 +39,12 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 JSON_PATH = DATA_DIR / "real_data.json"
 CI_CACHE_PATH = DATA_DIR / "ci_cache.json"
 
-JOB_DURATION = 8_000.0  # seconds – the job timestamp
-DELTA = 10.0  # seconds – width of each pause window
-MAX_STEPS = 1_000  # maximum number of cut-out attempts
-PATIENCE = 10  # early-stop after this many non-improving cuts
-MIN_IMPROVE = 1e-6  # stop when marginal improvement < this fraction
-N_INTERP = 8_000  # interpolation grid resolution
+JOB_DURATION  = 8_000.0      # seconds – the job timestamp
+DELTA         = 10.0          # seconds – width of each pause window
+MAX_STEPS     = 1_000         # maximum number of cut-out attempts
+PATIENCE      = 50             # early-stop after this many non-improving cuts
+MIN_IMPROVE   = 1e-6          # stop when marginal improvement < this fraction
+N_INTERP      = 8_000         # interpolation grid resolution
 
 
 # ────────────────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ def compressed_to_real(x, sorted_real_cuts, delta):
     return pos
 
 
-def find_best_cut(f_arr, g_arr, h, delta_idx):
+def find_best_cut(f_arr, g_arr, h, delta_idx, margin=0):
     """
     Given fixed f and g arrays on a uniform grid with spacing *h*,
     find the cut position that minimises ∫₀ᵀ f·g' where g' is g
@@ -202,6 +202,8 @@ def find_best_cut(f_arr, g_arr, h, delta_idx):
     g_arr     : ndarray, shape (≥ N + delta_idx,)  – carbon intensity
     h         : float                  – grid spacing
     delta_idx : int                    – width of cut in grid cells
+    margin    : int                    – exclude the last *margin*
+                indices from the search (avoids trivial boundary cuts)
 
     Returns
     -------
@@ -231,7 +233,9 @@ def find_best_cut(f_arr, g_arr, h, delta_idx):
     # J(i) = ∫₀^{x_i} f·g  +  ∫_{x_i}^T f·g_shifted
     J_all = F_cum + (G_cum[-1] - G_cum)
 
-    best_idx = int(np.argmin(J_all))
+    # Restrict search to [0, N - margin) to exclude trivial boundary cuts
+    search_end = max(1, N - margin)
+    best_idx = int(np.argmin(J_all[:search_end]))
     return best_idx, float(J_all[best_idx])
 
 
@@ -311,7 +315,10 @@ def run_optimisation(
             break
 
         # ── Find the best single cut on current g ─────────────
-        cut_idx, J_val = find_best_cut(f_arr, g_arr, h, delta_idx)
+        # During patience: exclude boundary (last delta_idx indices)
+        # to avoid trivial zero-effect cuts and force interior exploration.
+        m = delta_idx if no_improve_count > 0 else 0
+        cut_idx, J_val = find_best_cut(f_arr, g_arr, h, delta_idx, margin=m)
 
         # Map compressed-domain index → original g time
         a_s = cut_idx * h
@@ -337,12 +344,15 @@ def run_optimisation(
         ):
             tag = ""
             if no_improve_count > 0:
-                tag = f" [no improve {no_improve_count}/{patience}]"
-            print(
-                f"  Step {step_i + 1}: a_real={real_a:.1f} s, "
-                f"J={J_val:.4f}, saved {baseline_J - J_val:.4f} "
-                f"({(baseline_J - J_val) / baseline_J * 100:.2f}%){tag}"
-            )
+                tag = (f" [no improve {no_improve_count}/{patience}, "
+                       f"current J={J_val:.4f}]")
+            print(f"  Step {step_i+1}: a_real={real_a:.1f} s, "
+                  f"best_J={best_J:.4f}, saved {baseline_J - best_J:.4f} "
+                  f"({(baseline_J - best_J)/baseline_J*100:.2f}%){tag}")
+
+        # ── Stitch g: always apply the cut so subsequent iterations
+        #    see a different landscape (needed to escape local optima) ──
+        g_arr = crop_g(g_arr, cut_idx, delta_idx)
 
         if no_improve_count >= patience:
             if verbose:
@@ -352,9 +362,6 @@ def run_optimisation(
                     f"J={best_J:.4f})."
                 )
             break
-
-        # ── Stitch g: remove the cut and continue ─────────────
-        g_arr = crop_g(g_arr, cut_idx, delta_idx)
 
     # Return the best tracked schedule
     sorted_real_cuts = best_real_cuts if best_real_cuts else sorted_real_cuts
