@@ -113,6 +113,7 @@ class CO2Calculator:
             f_func,
             g_func,
             T,
+            g_end_time=float(ci_times[-1]),
             delta=delta,
             max_steps=max_steps,
             patience=patience,
@@ -167,6 +168,117 @@ class CO2ProxyService:
             json.dump(policies, f, indent=2)
 
         return result
+
+    def get_aggregate(self, file_hash: str, location: str) -> Dict[str, Any]:
+        """
+        Run the optimiser and return the duration-vs-CO2 trade-off curve.
+
+        Each optimisation step inserts one additional pause of width
+        ``eff_delta``, increasing wall-clock duration while (generally)
+        reducing CO2.  The returned arrays let the frontend plot
+        *duration* on the X-axis and *CO2 emissions* on the Y-axis.
+
+        Also stores a small set of schedulable policies (baseline,
+        optimal, and a few intermediate milestones) so that the
+        ``/schedule`` endpoint can execute them.
+
+        Returns
+        -------
+        dict with keys:
+            file_hash, location, job_duration_s, delta_s,
+            num_optimal_pauses, baseline_co2, optimised_co2,
+            durations, co2_emissions, policy_ids
+        """
+        data = load_from_db(file_hash)
+        if not data:
+            raise ValueError("Data not found for the given file hash")
+
+        # 1. Build f(t) and g(t)
+        f_func, step_boundaries, _ = create_power_function_from_data(data)
+        T = float(step_boundaries[-1])
+
+        zone_cache = DATA_DIR / f"ci_cache_{location}.json"
+        ci_times, ci_values = fetch_and_cache_carbon_intensity(
+            zone_cache, zone=location
+        )
+        g_func = create_co2_interpolator(ci_times, ci_values)
+
+        # 2. Run the optimisation
+        sorted_real_cuts, J_history, baseline_J, eff_delta = run_optimisation(
+            f_func,
+            g_func,
+            T,
+            g_end_time=float(ci_times[-1]),
+            delta=DELTA,
+            max_steps=MAX_STEPS,
+            patience=PATIENCE,
+            verbose=False,
+        )
+
+        # 3. Build the trade-off curve from J_history
+        #    J_history[k] is the CO2 cost after step k+1.
+        #    Duration at step k+1 = T + (k+1) * eff_delta.
+        #    We track a running minimum so the curve reflects the
+        #    best achievable CO2 at each duration level.
+        durations: List[float] = [round(T, 2)]
+        co2_emissions: List[float] = [round(baseline_J, 4)]
+        policy_ids: List[str] = ["baseline"]
+
+        running_min = baseline_J
+        for k, j_val in enumerate(J_history):
+            running_min = min(running_min, j_val)
+            durations.append(round(float(T + (k + 1) * eff_delta), 2))
+            co2_emissions.append(round(float(running_min), 4))
+            policy_ids.append(f"step_{k + 1}")
+
+        # 4. Generate & store schedulable policies at key milestones
+        n_optimal = len(sorted_real_cuts)
+        optimal_co2 = co2_emissions[-1] if co2_emissions else round(baseline_J, 4)
+
+        policies_path = f"{file_hash}_policies.json"
+        policies: Dict[str, Any] = {}
+        if os.path.exists(policies_path):
+            with open(policies_path, "r") as f:
+                policies = json.load(f)
+
+        # Baseline (no pauses)
+        policies["baseline"] = {
+            "policy": [{"start": 0.0, "end": round(T, 2), "throttle": 1.0}]
+        }
+
+        # Full optimal policy
+        optimal_policy = cuts_to_policy(sorted_real_cuts, eff_delta, T)
+        policies["co2_optimised"] = {"policy": optimal_policy}
+
+        # Intermediate milestone policies at 25%, 50%, 75% of cuts
+        if n_optimal > 1:
+            for pct in (25, 50, 75):
+                n_cuts = max(1, int(round(n_optimal * pct / 100)))
+                if n_cuts >= n_optimal:
+                    continue
+                subset = sorted_real_cuts[:n_cuts]
+                key = f"co2_{pct}pct"
+                policies[key] = {
+                    "policy": cuts_to_policy(subset, eff_delta, T),
+                    "num_pauses": n_cuts,
+                    "duration_s": round(T + n_cuts * eff_delta, 2),
+                }
+
+        with open(policies_path, "w") as f:
+            json.dump(policies, f, indent=2)
+
+        return {
+            "file_hash": file_hash,
+            "location": location,
+            "job_duration_s": round(T, 2),
+            "delta_s": round(eff_delta, 4),
+            "num_optimal_pauses": n_optimal,
+            "baseline_co2": round(baseline_J, 4),
+            "optimised_co2": optimal_co2,
+            "durations": durations,
+            "co2_emissions": co2_emissions,
+            "policy_ids": policy_ids,
+        }
 
 
 co2_service = CO2ProxyService()

@@ -118,6 +118,29 @@ async def get_co2(file_hash: str, location: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/aggregate")
+async def aggregate(file_hash: str, location: str):
+    """
+    Return the duration-vs-CO2 trade-off curve.
+
+    For each optimisation step an additional pause of width ``eff_delta``
+    is inserted, increasing wall-clock duration while (generally)
+    reducing CO2.  The returned arrays let the frontend plot
+    *duration* on the X-axis and *CO2 emissions* on the Y-axis,
+    together with the ids of the policies that correspond to each point.
+    """
+    try:
+        result = co2_service.get_aggregate(file_hash, location)
+        return JSONResponse(
+            content={"status": "success", "result": result},
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/schedule")
 async def schedule(
     file: UploadFile = File(...), location: str = Form(...), policy: str = Form(...)
