@@ -2,7 +2,6 @@ import sys
 import argparse
 import importlib.util
 import inspect
-import json
 import time
 from pathlib import Path
 
@@ -10,23 +9,15 @@ _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from profiler.models import TrainingJob, JobConfig
+from profiler.plotter import plot, plot_power
 
+# Number of initial steps to discard as warmup (e.g. for JIT compilation, caching, etc.)
 WARMUP_STEPS = 5
+
+# Fallback TDP in watts for time-based energy estimates when no GPU is available (e.g. CPU-only). Adjust as needed.
 DEFAULT_TDP_W = 250
-
-
-def _zeus_available():
-    try:
-        from zeus.monitor import ZeusMonitor
-        ZeusMonitor(gpu_indices=[0])
-        return True
-    except Exception:
-        return False
-
 
 class _FallbackResult:
     """Time-based energy estimate when Zeus is unavailable (no NVIDIA/AMD GPU)."""
@@ -46,8 +37,17 @@ class _FallbackMonitor:
         elapsed = time.perf_counter() - self._start
         return _FallbackResult(elapsed, self._tdp_w)
 
-
-def load_job(script_path: str) -> TrainingJob:
+def _load_job(script_path: str) -> TrainingJob:
+    """
+    Dynamically load the user script and find the TrainingJob subclass.
+    
+    Args:
+        script_path: Path to the user job script.
+    Returns:
+        An instance of the TrainingJob subclass defined in the user script.
+    Raises:
+        ValueError: If no TrainingJob subclass is found or if multiple are found.
+    """
     spec = importlib.util.spec_from_file_location("user_job", script_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -65,7 +65,7 @@ def load_job(script_path: str) -> TrainingJob:
 
 
 def profile(script_path: str, profile_epochs: int = 1, warmup_steps: int = WARMUP_STEPS, tdp_w: float = DEFAULT_TDP_W):
-    job = load_job(script_path)
+    job = _load_job(script_path)
     config: JobConfig = job.configure()
 
     job.setup()
@@ -73,10 +73,10 @@ def profile(script_path: str, profile_epochs: int = 1, warmup_steps: int = WARMU
     steps_per_epoch = len(loader)
     total_profile_steps = steps_per_epoch * profile_epochs
 
-    if _zeus_available():
+    try:
         from zeus.monitor import ZeusMonitor
         monitor = ZeusMonitor(gpu_indices=config.gpu_indices)
-    else:
+    except Exception:
         print("WARNING: No supported GPU found, using time-based energy estimates.")
         monitor = _FallbackMonitor(tdp_w=tdp_w)
 
@@ -107,14 +107,7 @@ def profile(script_path: str, profile_epochs: int = 1, warmup_steps: int = WARMU
     return np.array(step_energies), np.array(step_times), steps_per_epoch, config
 
 
-def _time_axis(seconds: np.ndarray):
-    """Return (values, unit) choosing ms or s for readability."""
-    if seconds.max() < 1.0:
-        return seconds * 1000, "ms"
-    return seconds, "s"
-
-
-def extrapolate_and_plot(
+def extrapolate(
     step_energies: np.ndarray,
     step_times: np.ndarray,
     steps_per_epoch: int,
@@ -130,9 +123,6 @@ def extrapolate_and_plot(
 
     cum_time_s = time_mean * np.arange(1, total_steps + 1)
     cumulative_energy = energy_mean * np.arange(1, total_steps + 1) / 3600
-    upper_energy = (energy_mean + energy_std) * np.arange(1, total_steps + 1) / 3600
-    lower_energy = (energy_mean - energy_std) * np.arange(1, total_steps + 1) / 3600
-    epoch_times_s = np.array([steps_per_epoch * e * time_mean for e in range(1, config.total_epochs + 1)])
 
     reps = int(np.ceil(total_steps / len(step_energies)))
     pred_energies = np.tile(step_energies, reps)[:total_steps]
@@ -154,50 +144,8 @@ def extrapolate_and_plot(
         "step_energy_J": [round(e, 4) for e in pred_energies.tolist()],
         "step_time_s": [round(t, 6) for t in pred_times.tolist()],
     }
-    assets_dir = Path(__file__).resolve().parent / "assets"
-    assets_dir.mkdir(exist_ok=True)
-    json_path = assets_dir / f"{out_stem}_profile.json"
-    with open(json_path, "w") as f:
-        json.dump(output, f, indent=2)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-
-    # Left: measured per-step energy during profiling
-    profiled_times_cum = np.cumsum(step_times)
-    ptime, punit = _time_axis(profiled_times_cum)
-    axes[0].plot(ptime, step_energies, color="steelblue")
-    axes[0].axhline(energy_mean, color="red", linestyle="--", label=f"mean = {energy_mean:.2f} J")
-    axes[0].fill_between(ptime,
-                         energy_mean - energy_std, energy_mean + energy_std,
-                         alpha=0.2, color="red", label="±1σ")
-    axes[0].set_xlabel(f"Time ({punit})")
-    axes[0].set_ylabel("Energy (J)")
-    axes[0].set_title(f"Measured per-step energy — {profile_epochs} epoch(s) profiled")
-    axes[0].legend()
-
-    # Right: tiled per-step energy extrapolated over full training
-    ext_times_cum = np.cumsum(pred_times)
-    ext_time, ext_unit = _time_axis(ext_times_cum)
-    epoch_marks, _ = _time_axis(epoch_times_s)
-    axes[1].plot(ext_time, pred_energies, color="steelblue", alpha=0.6)
-    axes[1].axhline(energy_mean, color="red", linestyle="--", label=f"mean = {energy_mean:.2f} J")
-    axes[1].fill_between(ext_time,
-                         energy_mean - energy_std, energy_mean + energy_std,
-                         alpha=0.2, color="red", label="±1σ")
-    for xb in epoch_marks:
-        axes[1].axvline(xb, color="gray", linestyle="--", alpha=0.4)
-    axes[1].set_xlabel(f"Time ({ext_unit})")
-    axes[1].set_ylabel("Energy (J)")
-    axes[1].set_title(f"Projected per-step energy — {config.total_epochs} epochs")
-    axes[1].legend()
-
-    plt.tight_layout()
-    plot_path = assets_dir / f"{out_stem}_energy.png"
-    plt.savefig(plot_path, dpi=150)
-    print(f"Plot saved to {plot_path}")
-    print(f"Results saved to {json_path}")
-    print(f"\nEstimated total energy: {cumulative_energy[-1]:.2f} Wh  (±{(upper_energy[-1]-lower_energy[-1])/2:.2f} Wh)")
-    print(f"Estimated total time: {cum_time_s[-1]:.1f} s")
+    return output
 
 
 if __name__ == "__main__":
@@ -211,4 +159,7 @@ if __name__ == "__main__":
     out_stem = Path(args.script).stem
 
     step_energies, step_times, steps_per_epoch, config = profile(args.script, profile_epochs=args.epochs, warmup_steps=args.steps, tdp_w=args.default_tdp_w)
-    extrapolate_and_plot(step_energies, step_times, steps_per_epoch, config, out_stem, profile_epochs=args.epochs)
+    output = extrapolate(step_energies, step_times, steps_per_epoch, config, out_stem, profile_epochs=args.epochs)
+    
+    plot(output, out_stem)
+    plot_power(output, out_stem)
