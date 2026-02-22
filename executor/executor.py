@@ -45,17 +45,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import matplotlib
-import matplotlib.pyplot as plt
 import torch
-
-matplotlib.use("Agg")
 
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from profiler.models import TrainingJob  # noqa: E402
+import numpy as np
+from profiler.models import TrainingJob, JobConfig  # noqa: E402
+from executor.plotter import plot_execution
 
 try:
     import pynvml as _pynvml
@@ -207,73 +205,61 @@ class ExecutionMonitor:
     # Output
     # ------------------------------------------------------------------
 
-    def save(self, out_stem: str) -> None:
+    def save(self, out_stem: str, config: Optional[JobConfig] = None, steps_per_epoch: Optional[int] = None) -> None:
         """Save recorded samples as JSON and a PNG plot."""
         assets_dir = Path(__file__).resolve().parent.parent / "profiler" / "assets"
         assets_dir.mkdir(exist_ok=True)
 
         # ── JSON ────────────────────────────────────────────────────────
         json_path = assets_dir / f"{out_stem}_execution.json"
+        
+        # Transform execution data to match extrapolate output format
+        step_energies = []
+        step_times = []
+        throttles = []
+        for i in range(1, len(self._samples)):
+            dt = self._samples[i].time_s - self._samples[i-1].time_s
+            if dt <= 0:
+                continue
+            power = self._samples[i].power_w
+            if power is None:
+                power = 0.0
+            step_times.append(dt)
+            step_energies.append(power * dt)
+            throttles.append(self._samples[i].throttle)
+            
+        energy_mean = np.mean(step_energies) if step_energies else 0.0
+        energy_std = np.std(step_energies) if step_energies else 0.0
+        time_mean = np.mean(step_times) if step_times else 0.0
+        time_std = np.std(step_times) if step_times else 0.0
+        total_steps = len(step_energies)
+        
+        total_epochs = config.total_epochs if config else 1
+        spe = steps_per_epoch if steps_per_epoch else total_steps
+            
+        output = {
+            "profiled_epochs": 1,
+            "steps_per_epoch": spe,
+            "total_epochs": total_epochs,
+            "total_steps": total_steps,
+            "mean_energy_per_step_J": round(float(energy_mean), 4),
+            "std_energy_per_step_J": round(float(energy_std), 4),
+            "mean_time_per_step_s": round(float(time_mean), 6),
+            "std_time_per_step_s": round(float(time_std), 6),
+            "estimated_total_energy_Wh": round(sum(step_energies) / 3600, 4),
+            "estimated_total_time_s": round(sum(step_times), 2),
+            "profiled_step_energy_J": [round(e, 4) for e in step_energies],
+            "profiled_step_time_s": [round(t, 6) for t in step_times],
+            "step_energy_J": [round(e, 4) for e in step_energies],
+            "step_time_s": [round(t, 6) for t in step_times],
+            "throttles": throttles
+        }
+        
         with open(json_path, "w") as f:
-            json.dump(
-                [
-                    {
-                        "time_s": s.time_s,
-                        "throttle": s.throttle,
-                        "gpu_util_pct": s.gpu_util_pct,
-                        "power_w": s.power_w,
-                    }
-                    for s in self._samples
-                ],
-                f,
-                indent=2,
-            )
+            json.dump(output, f, indent=2)
         print(f"[Monitor] Data saved → {json_path}")
 
         # ── Plot ────────────────────────────────────────────────────────
-        times = [s.time_s for s in self._samples]
-        throttles = [s.throttle for s in self._samples]
-        gpu_utils = [s.gpu_util_pct for s in self._samples]
-        powers = [s.power_w for s in self._samples]
-
-        has_gpu = any(v is not None for v in gpu_utils)
-        n_panels = 3 if has_gpu else 1
-        fig, axes = plt.subplots(n_panels, 1, figsize=(12, 3 * n_panels), sharex=True)
-
-        if n_panels == 1:
-            axes = [axes]
-
-        # Panel 1 – throttle
-        axes[0].step(times, throttles, where="post", color="steelblue", lw=1.8)
-        axes[0].set_ylim(-0.05, 1.05)
-        axes[0].set_ylabel("Throttle")
-        axes[0].set_title("Policy throttle")
-        axes[0].yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.0%}")
-        )
-        axes[0].grid(True, alpha=0.3)
-
-        if has_gpu:
-            # Panel 2 – GPU utilisation
-            axes[1].plot(times, gpu_utils, color="seagreen", lw=1.2)
-            axes[1].set_ylim(-2, 105)
-            axes[1].set_ylabel("GPU util (%)")
-            axes[1].set_title("GPU utilisation")
-            axes[1].grid(True, alpha=0.3)
-
-            # Panel 3 – power draw
-            axes[2].plot(times, powers, color="darkorange", lw=1.2)
-            axes[2].set_ylabel("Power (W)")
-            axes[2].set_title("GPU power draw")
-            axes[2].grid(True, alpha=0.3)
-
-        axes[-1].set_xlabel("Time (s)")
-        plt.tight_layout()
-
-        plot_path = assets_dir / f"{out_stem}_execution.png"
-        plt.savefig(plot_path, dpi=150)
-        plt.close(fig)
-        print(f"[Monitor] Plot saved  → {plot_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +373,7 @@ class Executor:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, job: TrainingJob) -> None:
+    def run(self, job: TrainingJob) -> tuple[JobConfig, int]:
         """
         Execute *job* under the configured throttle policy.
 
@@ -459,6 +445,8 @@ class Executor:
             if self.monitor is not None:
                 self.monitor.stop()
             job.teardown()
+            
+        return config, len(loader)
 
 
 # ---------------------------------------------------------------------------
@@ -552,5 +540,7 @@ Examples:
     monitor = ExecutionMonitor(gpu_index=args.gpus[0], poll_interval=args.poll_interval)
     job = _load_job(args.script)
     executor = Executor(policy=policy, gpu_indices=args.gpus, monitor=monitor)
-    executor.run(job)
-    monitor.save(out_stem)
+    config, steps_per_epoch = executor.run(job)
+    monitor.save(out_stem, config, steps_per_epoch)
+    plot_execution(executor._samples, out_stem)
+

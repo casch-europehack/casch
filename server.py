@@ -128,6 +128,19 @@ async def schedule(
         temp_file_path = temp_file.name
 
     file_hash = hashlib.sha256(content).hexdigest()
+    cache_key = f"{file_hash}_{policy}"
+
+    # Check if we already have a stored result
+    existing_data = load_from_db(cache_key)
+    if existing_data:
+        # Clean up the temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        return {
+            "status": "success",
+            "message": "Returned cached scheduling results.",
+            "result": existing_data,
+        }
 
     try:
         # Load the policy from the policies.json file
@@ -166,12 +179,34 @@ async def schedule(
             raise HTTPException(status_code=500, detail="Executor did not produce output JSON.")
             
         with open(json_path, "r") as f:
-            execution_data = json.load(f)
+            output = json.load(f)
+            
+        # Aggregate intervals to reduce data size
+        agg_energies, agg_times = aggregate_intervals(
+            np.array(output["step_energy_J"]),
+            np.array(output["step_time_s"]),
+            num_blocks=200,
+        )
+
+        # Update output with aggregated data
+        output["step_energy_J"] = agg_energies.tolist()
+        output["step_time_s"] = agg_times.tolist()
+
+        # Translate to power timeseries
+        translator = PowerTranslator(output)
+        power_timeseries = translator.to_timeseries(resolution_s=1.0)
+        power_intervals = translator.get_intervals()
+
+        output["power_timeseries"] = power_timeseries
+        output["power_intervals"] = power_intervals
+
+        # --- Store ---
+        save_to_db(cache_key, output)
             
         return {
             "status": "success",
             "message": "Scheduling completed successfully.",
-            "result": execution_data
+            "result": output
         }
         
     except HTTPException:
